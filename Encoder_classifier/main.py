@@ -42,14 +42,14 @@ param_grid = {
         'batch_size' : [100, 300]
     }
 # ENCODER PARAMETERS
-EN_binary_loss_weight = [ 0.001, 0.01, 0.5, None]# very important
+EN_binary_loss_weight = [ 0.001, 0.01, 0.5, 0]# very important
 EN_batch_size = [300]
 EN_learning_rate = [0.0015, 0.003]
 EN_plot = False
 EN_embedding_perc_list = [2, 3, 0.8, 0.5]
 EN_kl = [0, 0.1, 0.5, 1.0, 1.5]
 EN_num_epochs = [250]
-EN_masked_percentage_list = [0.2, 0.35, 0.5]
+EN_masked_percentage_list = [0, 0.2, 0.35, 0.5]
 EN_patience = [10]
 
 device = set_cpu()
