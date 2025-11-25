@@ -49,7 +49,7 @@ EN_plot = False
 EN_embedding_perc_list = [2, 3, 0.8, 0.5]
 EN_kl = [0, 0.1, 0.5, 1.0, 1.5]
 EN_num_epochs = [250]
-EN_masked_percentage_list = [0, 0.2, 0.35, 0.5]
+EN_masked_percentage_list = [0.2, 0.35, 0.5]
 EN_patience = [10]
 
 device = set_cpu()
