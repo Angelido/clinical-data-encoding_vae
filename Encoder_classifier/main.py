@@ -117,7 +117,6 @@ for comb in tqdm(combinations, desc="Processing combinations", colour="green"):
                 tr=extended_tr_data,
                 vl=val_data,
                 optim=optimizer,
-                bs=en_bs,
                 bw=en_bin_loss_w,
                 kl_beta=en_kl,
                 ep=en_num_ep,

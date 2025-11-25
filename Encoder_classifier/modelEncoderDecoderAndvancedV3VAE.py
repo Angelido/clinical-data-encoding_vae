@@ -127,14 +127,13 @@ class MIEOVAE(nn.Module):
 			losses[key] /= num_batches
 		return losses
 	
-	def fit(self, tr, vl, optim, bs, bw, kl_beta, ep, mask_perc, es, pedantic=False):
+	def fit(self, tr, vl, optim, bw, kl_beta, ep, mask_perc, es, pedantic=False):
 		"""
 		Train the VAE model
 		Args:
 			tr (torch.utils.data.Dataloader): Training dataloader
 			vl (torch.utils.data.Dataloader): Validation dataloader
 			optim (torch.optim.Optimizer): Optimizer
-			bs (int): Batch size
 			bw (float): Binary weight for loss
 			kl_beta (float): Beta for KL divergence (incremented from 0 to kl_beta during training)
 			ep (int): Number of epochs
