@@ -1,13 +1,13 @@
+import json
 import os
 import warnings
 from time import time
-from typing import List
 
 import numpy as np
 import torch
 from joblib import Memory
 from sklearn.metrics import classification_report
-from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from sklearn.pipeline import Pipeline
 from skorch import NeuralNetClassifier
 from skorch.callbacks import EarlyStopping
@@ -35,38 +35,21 @@ VAE_GRID_COMMON = {
 }
 
 
-def _merged(*parts: dict) -> dict:
-    merged = {}
-    for part in parts:
-        merged.update(part)
-    return merged
-
-
-def build_param_grid(latent_dims: List[int], baseline_input_dim: int) -> List[dict]:
+def build_param_grid(latent_dims: list[int], baseline_input_dim: int) -> list[dict]:
     """
     Tie classifier input size to VAE latent size by creating one grid dict per latent_dim.
     """
-    grid_list = []
-    for ld in latent_dims:
-        grid_list.append(
-            _merged(
-                VAE_GRID_COMMON,
-                CLF_GRID_COMMON,
-                {
-                    "vae__module__latent_dim": [ld],
-                    "clf__module__inputSize": [ld],
-                },
-            )
+    grid_list = [
+        (
+            VAE_GRID_COMMON
+            | CLF_GRID_COMMON
+            | {"vae__module__latent_dim": [ld], "clf__module__inputSize": [ld]}
         )
-    # Baseline: no encoder, classifier sees [values | null_mask] directly.
+        for ld in latent_dims
+    ]
     grid_list.append(
-        _merged(
-            CLF_GRID_COMMON,
-            {
-                "vae": ["passthrough"],
-                "clf__module__inputSize": [baseline_input_dim],
-            },
-        )
+        CLF_GRID_COMMON
+        | {"vae": ["passthrough"], "clf__module__inputSize": [baseline_input_dim]}
     )
     return grid_list
 
@@ -93,10 +76,8 @@ def run():
 
     cv_split = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     
-    pos = float(y_dev.sum())
-    neg = float(len(y_dev) - pos)
-    pos_weight = neg / max(pos, 1.0)
-    data_dim = X_dev.shape[1] // 2 
+    pos_weight = (len(y_dev) - float(np.sum(y_dev))) / max(float(np.sum(y_dev)), 1.0)
+    data_dim = X_dev.shape[1] // 2
 
     memory = Memory(location="_pipe_cache_", verbose=0)
 
@@ -154,8 +135,6 @@ def run():
     }
     save_path = "./Encoder_classifier/gridResults/last_results.json"
     with open(save_path, "w") as f:
-        import json
-
         json.dump(output, f, indent=4)
 
     print(f"Fit completed in {fit_time/60:.1f} min")
