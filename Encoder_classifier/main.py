@@ -1,193 +1,214 @@
-#only because i don't wnat ot break the other main.py
-import warnings
-#warnings.simplefilter(action='ignore', category=FutureWarning)
-
-from time import time
-from classifier import ClassifierBinary
-from modelEncoderDecoderAndvancedV3VAE import MIEOVAE
-from itertools import product
-from tqdm import tqdm
-import torch
 import os
-import sys
-sys.path.insert(1, os.path.join(sys.path[0], '..'))
-from utilsData import dataset_loader_full, set_gpu, set_cpu, load_past_results_and_models, is_intel_xeon
-import json
+import warnings
+from time import time
+from typing import List
+
+import numpy as np
+import torch
+from joblib import Memory
 from sklearn.metrics import classification_report
+from sklearn.model_selection import GridSearchCV, PredefinedSplit, train_test_split
+from sklearn.pipeline import Pipeline
 from skorch import NeuralNetClassifier
-from sklearn.model_selection import GridSearchCV
 from skorch.callbacks import EarlyStopping
 
-######################################################
-#                                                    #
-#                                                    #
-#                    _______________                 #
-#                   /      RIP      \                #
-#                  /                 \               #
-#                 |     Here Lies     |              #
-#                 |       Intel       |              #
-#                 |        Xeon       |              #
-#                 |    2024 - 2024    |              #
-#                 |___________________|              #
-#                      |         |                   #
-#                      |         |                   #
-#                                                    #
-######################################################
+from classifier import ClassifierBinary
+from modelEncoderDecoderAndvancedV3VAE import MIEOVAE
+from utilsData import load_known_unknown, preprocess_known_unknown_split, set_cpu
 
-# CLASSIFIER PARAMETERS
-param_grid = {
-        'optimizer__lr' : [0.0005, 0.001, 0.005, 0.01],
-        'optimizer__weight_decay' : [0.01e-5, 0.05e-5, 0.1e-5, 0.5e-5],
-        'max_epochs' : [50],
-        'batch_size' : [100, 300]
-    }
-# ENCODER PARAMETERS
-EN_binary_loss_weight = [ 0.001, 0.01, 0.5, 0]# very important
-EN_batch_size = [300]
-EN_learning_rate = [0.0015, 0.003]
-EN_plot = False
-EN_embedding_perc_list = [2, 3, 0.8, 0.5]
-EN_kl = [0, 0.1, 0.5, 1.0, 1.5]
-EN_num_epochs = [250]
-EN_masked_percentage_list = [0, 0.2, 0.35, 0.5]
-EN_patience = [10]
+warnings.filterwarnings("ignore", category=UserWarning)
 
-device = set_cpu()
 
-# LOAD DATASET
-#TODO: load dataset
-dict = None
-if dict is None:
-    raise NotImplementedError("Load your dataset here and prepare training and validation sets.")
-extended_tr_data = dict['tr_unlabled']
-tr_data = dict['tr_data']
-tr_out = dict['tr_out']
-val_data = dict['val_data']
-val_out = dict['val_out']
-binary_clumns = dict['bin_col']
-#count the pos number
-posCount = tr_out.sum()
-negCount = tr_out.shape[0] - posCount
-posWeight = negCount/posCount
-print(f'Positive count: {posCount}')
-print(f'Negative count: {negCount}')
-print(f'Positive weight: {posWeight}')
-print(f'Shape of tr_out: {tr_out.shape}')
+CLF_GRID_COMMON = {
+    "clf__lr": [1e-3, 3e-4],
+    "clf__max_epochs": [50],
+    "clf__batch_size": [128],
+}
 
-# json      models in directory     validated models
-results,    existing_models,        validated_models = load_past_results_and_models()
+VAE_GRID_COMMON = {
+    "vae__lr": [1e-3, 3e-4],
+    "vae__max_epochs": [50],
+    "vae__batch_size": [256],
+    "vae__module__mask_percentage": [0.1, 0.2],
+    "vae__beta": [0.1, 1.0],
+    "vae__binary_weight": [0.5, 1.0],
+}
 
-begin = time()
-combinations = list(product(EN_binary_loss_weight, EN_batch_size, EN_learning_rate, EN_embedding_perc_list, EN_kl, EN_num_epochs, EN_masked_percentage_list, EN_patience))
-combinations.insert(0, (None,)*len(combinations[0]))
-print(f'Number of combinations: {len(combinations)}')
-for comb in tqdm(combinations, desc="Processing combinations", colour="green"):
-    en_bin_loss_w, en_bs, en_lr, en_emb_perc, en_kl, en_num_ep, en_masked_perc, en_pt = comb
+
+def _merged(*parts: dict) -> dict:
+    merged = {}
+    for part in parts:
+        merged.update(part)
+    return merged
+
+
+def build_param_grid(latent_dims: List[int], baseline_input_dim: int) -> List[dict]:
+    """
+    Tie classifier input size to VAE latent size by creating one grid dict per latent_dim.
+    """
+    grid_list = []
+    for ld in latent_dims:
+        grid_list.append(
+            _merged(
+                VAE_GRID_COMMON,
+                CLF_GRID_COMMON,
+                {
+                    "vae__module__latent_dim": [ld],
+                    "clf__module__inputSize": [ld],
+                },
+            )
+        )
+    # Baseline: no encoder, classifier sees [values | null_mask] directly.
+    grid_list.append(
+        _merged(
+            CLF_GRID_COMMON,
+            {
+                "vae": ["passthrough"],
+                "clf__module__inputSize": [baseline_input_dim],
+            },
+        )
+    )
+    return grid_list
+
+
+def _pos_weight_from_train_labels(y_train: torch.Tensor) -> float:
+    pos = float(y_train.sum().item())
+    neg = float(y_train.shape[0] - pos)
+    return neg / max(pos, 1.0)
+
+
+def run():
+    device = set_cpu()
     torch.manual_seed(42)
 
-    encoder_string = f'encoder_{en_bin_loss_w}_{en_bs}_{en_lr}_{en_emb_perc}_{en_kl}_{en_num_ep}_{en_masked_perc}_{en_pt}'
+    # ----------------------------------------------------------------------
+    # Load raw labeled/unlabeled data, then define the split strategy here.
+    #
+    # Keeping the split logic in main makes it easy to switch to StratifiedKFold in the future:
+    # - first create a hold-out test split on labeled data
+    # - then run StratifiedKFold on the remaining labeled dev set
+    # - call preprocess_known_unknown_split per fold (or move preprocessing into a Pipeline step)
+    # ----------------------------------------------------------------------
+    years = 8
+    dataset_known, dataset_unknown = load_known_unknown(years=years)
+    y_all = dataset_known.iloc[:, -1].to_numpy()
+    all_idx = np.arange(len(y_all))
+    dev_idx, test_idx = train_test_split(
+        all_idx, test_size=0.2, random_state=42, stratify=y_all
+    )
+    train_idx, val_idx = train_test_split(
+        dev_idx, test_size=0.2, random_state=42, stratify=y_all[dev_idx]
+    )
+    data_dict = preprocess_known_unknown_split(
+        dataset_known=dataset_known,
+        dataset_unknown=dataset_unknown,
+        train_idx=train_idx,
+        val_idx=val_idx,
+        test_idx=test_idx,
+    )
+    tr_data = data_dict["tr_data"]
+    tr_out = data_dict["tr_out"]
+    val_data = data_dict["val_data"]
+    val_out = data_dict["val_out"]
+    test_data = data_dict["test_data"]
+    test_out = data_dict["test_out"]
+    X_unlabeled = data_dict.get("tr_unlabled")
+    binary_cols = data_dict["bin_col"]
 
-    ################################################################################################
-    # TRAIN ENCODER ################################################################################
-    ################################################################################################
-    if comb != (None,)*len(comb):
-        if encoder_string in validated_models:
-            print(f'{encoder_string} already validated')
-            continue
-        # create, train and save encoder
-        #TODO: create encoder defining the structure properly (hidden dims and latent dim)
-        latent_dim = None
-        hidden_dims = None
-        if latent_dim is None or hidden_dims is None:
-            raise NotImplementedError("Define the hidden dimensions and latent dimension for the MIEOVAE model.")
-        encoder = MIEOVAE(
-            input_dim=tr_data.shape[1], 
-            binary=binary_clumns,
-            latent_dim=latent_dim,
-            hidden_dims=hidden_dims
+    input_dim = tr_data.shape[1]
+    data_dim = input_dim // 2  # because preprocessing appends a same-size mask
+
+    # Build dev set (train + val) with a predefined split for CV
+    X_dev = torch.cat((tr_data, val_data), dim=0).cpu().numpy()
+    y_dev = torch.cat((tr_out, val_out), dim=0).cpu().numpy()
+    test_fold = np.concatenate(
+        (
+            np.full(tr_data.shape[0], -1, dtype=int),  # train indices
+            np.zeros(val_data.shape[0], dtype=int),  # validation fold = 0
         )
-        # check if encoder exists
-        if encoder_string + '.pth' in existing_models:
-            # load encoder
-            encoder:MIEOVAE = torch.load('./Encoder_classifier/gridResults/Models/' + encoder_string + '.pth', weights_only=False)
-            #encoder.load_state_dict(torch.load('./Encoder_classifier/gridResults/Models/' + encoder_string + '.pth', weights_only=True))
-        else:
-            optimizer = torch.optim.Adam(encoder.parameters(), lr=en_lr)
-            encoder.fit(
-                tr=extended_tr_data,
-                vl=val_data,
-                optim=optimizer,
-                bw=en_bin_loss_w,
-                kl_beta=en_kl,
-                ep=en_num_ep,
-                mask_perc=en_masked_perc,
-                es=en_pt,
-                pedantic=True
-            )
-            encoder.saveModel(f'./Encoder_classifier/gridResults/Models/{encoder_string}.pth')
-            existing_models.append(encoder_string + '.pth')
+    )
+    cv_split = PredefinedSplit(test_fold=test_fold)
 
-        encoder.freeze()
-        encoded_tr_data = encoder.encode(tr_data)
-        val_data_encoded = encoder.encode(val_data)
-        embedding_dim = encoder.latent_dim
-    else:
-        # TODO: check this part when the data is available
-        raise NotImplementedError("Check this part when the data is available.")
-        encoded_tr_data = tr_data.clone().detach()
-        val_data_encoded = val_data.clone().detach()
-        embedding_dim = tr_data.shape[1]
+    X_test = test_data.cpu().numpy()
+    y_test = test_out.cpu().numpy()
+    X_unlabeled_np = None if X_unlabeled is None else X_unlabeled.cpu().numpy()
 
-    ################################################################################################
-    # TRAIN CLASSIFIER #############################################################################
-    ################################################################################################
+    pos_weight = _pos_weight_from_train_labels(tr_out)
 
+    memory = Memory(location="_pipe_cache_", verbose=0)
 
-    model = NeuralNetClassifier(
-        module = ClassifierBinary,
-        module__inputSize = embedding_dim,
-        optimizer = torch.optim.Adam,
-        device = device,
-        criterion=torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([posWeight])),#TODO: this will be a hyperparameter (if they pay us enough)
+    vae_estimator = MIEOVAE(
+        module__data_dim=data_dim,
+        module__mask_dim=data_dim,
+        module__binary=binary_cols,
+        module__hidden_dims=[256, 128, 64],
+        optimizer=torch.optim.Adam,
+        lr=1e-3,
+        batch_size=256,
+        max_epochs=50,
+        device=device,
         verbose=0,
-        callbacks=[('early_stopping', EarlyStopping(patience=10))]
     )
 
-    grid = GridSearchCV(estimator=model, 
-                               param_grid=param_grid, 
-                               n_jobs=-1,
-                               verbose=0,
-                               scoring='balanced_accuracy',
-                               cv=4,
-                               #random_state=42, //For halving search
-                               )
-    
-    grid_result = grid.fit(encoded_tr_data, tr_out)
-    y_pred = grid.predict(val_data_encoded)
-    report = classification_report(val_out, y_pred, output_dict=True)
+    clf_estimator = NeuralNetClassifier(
+        module=ClassifierBinary,
+        module__inputSize=data_dim,  # overridden by grid
+        optimizer=torch.optim.Adam,
+        lr=1e-3,
+        batch_size=128,
+        max_epochs=50,
+        device=device,
+        criterion=torch.nn.BCEWithLogitsLoss,
+        criterion__pos_weight=torch.tensor([pos_weight], device=device),
+        iterator_train__shuffle=True,
+        callbacks=[("early_stopping", EarlyStopping(patience=8))],
+        verbose=0,
+    )
 
-    results.append({
-        'encoder_string': encoder_string,
-        'encoder': {
-            'binary_loss_weight': en_bin_loss_w,
-            'batch_size': en_bs,
-            'lr': en_lr,
-            'emb_perc': en_emb_perc,
-            'kl': en_kl,
-            'num_ep': en_num_ep,
-            'masked_perc': en_masked_perc,
-            'pt': en_pt
-        },
-        'classifier': grid.best_params_,
-        'results': report
-    })
-    with open('./Encoder_classifier/gridResults/results.json', 'w') as f:
-        json.dump(results, f, indent=4)
-        
-    
-end = time()
-print(f'using device: {device}')
-tot_time = end - begin
-print(f'Total time: {tot_time//60}m {tot_time%60}s')
-#print(results)
+    latent_dims = [8, 16, 32]
+    param_grid = build_param_grid(latent_dims, baseline_input_dim=input_dim)
 
+    pipe = Pipeline(steps=[("vae", vae_estimator), ("clf", clf_estimator)], memory=memory)
+
+    grid = GridSearchCV(
+        estimator=pipe,
+        param_grid=param_grid,
+        cv=cv_split,
+        scoring="balanced_accuracy",
+        n_jobs=1,  # safer for DL workloads
+        refit=True,
+        verbose=1,
+    )
+
+    begin = time()
+    grid.fit(X_dev, y_dev, vae__X_unlabeled=X_unlabeled_np)
+    fit_time = time() - begin
+
+    best_model = grid.best_estimator_
+    y_pred_test = best_model.predict(X_test)
+    report = classification_report(y_test, y_pred_test, output_dict=True)
+
+    os.makedirs("./Encoder_classifier/gridResults", exist_ok=True)
+    output = {
+        "best_params": grid.best_params_,
+        "best_score": grid.best_score_,
+        "test_report": report,
+        "fit_time_sec": fit_time,
+    }
+    save_path = "./Encoder_classifier/gridResults/last_results.json"
+    with open(save_path, "w") as f:
+        import json
+
+        json.dump(output, f, indent=4)
+
+    print(f"Fit completed in {fit_time/60:.1f} min")
+    print(f"Best CV balanced accuracy: {grid.best_score_:.4f}")
+    print("Best params:", grid.best_params_)
+    print("Test report:")
+    for k, v in report.items():
+        if isinstance(v, dict) and "f1-score" in v:
+            print(f"  {k}: f1={v['f1-score']:.3f}, precision={v['precision']:.3f}, recall={v['recall']:.3f}")
+
+
+if __name__ == "__main__":
+    run()

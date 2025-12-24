@@ -183,6 +183,83 @@ def dataset_loader_full(years:int) -> 'dict[str,torch.Tensor]':
 
     return dataset_loader(dataset, 0.2, 0.2, 42, oversampling=False, unlabledDataset=dataset_unk)
 
+
+def load_known_unknown(years: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Load the labeled ("known") and unlabeled ("unknown") datasets for a given horizon.
+
+    Returns the raw pandas DataFrames (no split / no preprocessing), so callers can
+    implement custom split strategies (e.g., StratifiedKFold) without changing IO.
+    """
+    folderName = f'./Datasets/Cleaned_Dataset_{years}Y/'
+    fileName_kn = 'chl_dataset_known.csv'
+    fileName_unk = 'chl_dataset_unknown.csv'
+    dataset = load_data(folderName + fileName_kn)
+    dataset_unk = load_data(folderName + fileName_unk)
+    return dataset, dataset_unk
+
+
+def preprocess_known_unknown_split(
+    dataset_known: pd.DataFrame,
+    dataset_unknown: pd.DataFrame,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    test_idx: np.ndarray,
+) -> 'dict[str,torch.Tensor]':
+    """
+    Preprocess known/unknown datasets given explicit split indices.
+
+    Expected layout:
+    - dataset_known: features + label in the last column
+    - dataset_unknown: features only (no label)
+
+    Output tensors follow the project convention:
+    - missing values are set to 0 in the values slice
+    - null mask is concatenated as additional features: X = [values | mask]
+    """
+    y_all = dataset_known.iloc[:, -1]
+    X_all = dataset_known.iloc[:, :-1]
+
+    train_out = y_all.iloc[train_idx]
+    val_out = y_all.iloc[val_idx]
+    test_out = y_all.iloc[test_idx]
+
+    train_data = X_all.iloc[train_idx].copy()
+    val_data = X_all.iloc[val_idx].copy()
+    test_data = X_all.iloc[test_idx].copy()
+
+    train_mask = (1 - train_data.isnull().astype(int)).to_numpy()
+    val_mask = (1 - val_data.isnull().astype(int)).to_numpy()
+    test_mask = (1 - test_data.isnull().astype(int)).to_numpy()
+
+    unknown_data = dataset_unknown.copy()
+    unknown_mask = (1 - unknown_data.isnull().astype(int)).to_numpy()
+
+    train_data, val_data, test_data, unknown_data, binary_clumns = normalize_data(
+        train_data, val_data, test_data, train_mask, unknown_data
+    )
+
+    train_data[train_mask == 0] = 0
+    val_data[val_mask == 0] = 0
+    test_data[test_mask == 0] = 0
+    unknown_data[unknown_mask == 0] = 0
+
+    train_arr = np.concatenate((train_data, train_mask), axis=1).astype(np.float32)
+    val_arr = np.concatenate((val_data, val_mask), axis=1).astype(np.float32)
+    test_arr = np.concatenate((test_data, test_mask), axis=1).astype(np.float32)
+    unknown_arr = np.concatenate((unknown_data, unknown_mask), axis=1).astype(np.float32)
+
+    return {
+        'tr_data': torch.from_numpy(train_arr),
+        'tr_out': torch.from_numpy(train_out.to_numpy()).float(),
+        'val_data': torch.from_numpy(val_arr),
+        'val_out': torch.from_numpy(val_out.to_numpy()).float(),
+        'test_data': torch.from_numpy(test_arr),
+        'test_out': torch.from_numpy(test_out.to_numpy()).float(),
+        'bin_col': binary_clumns,
+        'tr_unlabled': torch.from_numpy(unknown_arr),
+    }
+
 def load_past_results_and_models(old_results:bool=False)->Tuple[list,list,set]:
     '''
     function to load the past results and models
