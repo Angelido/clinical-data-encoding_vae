@@ -199,6 +199,80 @@ def load_known_unknown(years: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return dataset, dataset_unk
 
 
+def _build_values_and_mask(df_features: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Return (values_filled, null_mask) where:
+    - values_filled: NaNs replaced with 0.0
+    - null_mask: 1 for observed entries, 0 for missing
+    """
+    null_mask = (1 - df_features.isnull().astype(int)).to_numpy()
+    values_filled = df_features.fillna(0.0).to_numpy()
+    return values_filled, null_mask
+
+
+def infer_binary_feature_count(df_features: pd.DataFrame) -> int:
+    """
+    Infer how many binary features are present at the end of the feature vector.
+
+    This assumes the column order is:
+        [continuous..., binary...]
+    which is required by the current MIEO decoder/loss implementation.
+    """
+    is_binary = []
+    for col in df_features.columns:
+        observed = df_features[col].dropna()
+        if observed.empty:
+            is_binary.append(False)
+            continue
+        unique = set(observed.unique())
+        is_binary.append(unique.issubset({0, 1}))
+
+    if not any(is_binary):
+        return 0
+
+    first_binary = next((i for i, b in enumerate(is_binary) if b), None)
+    assert first_binary is not None
+    if any(not b for b in is_binary[first_binary:]):
+        raise ValueError(
+            "Binary features must be contiguous at the end of the feature vector "
+            "(expected [continuous..., binary...]). Reorder columns or provide a fixed "
+            "binary feature count from preprocessing."
+        )
+    return len(is_binary) - first_binary
+
+
+def load_mieo_tensors(years: int) -> 'dict[str,torch.Tensor | int]':
+    """
+    Minimal IO + mask construction for flexible CV strategies.
+
+    Returns:
+    - X_labeled: torch.FloatTensor [n_labeled, 2*data_dim] as [values | null_mask]
+    - y_labeled: torch.FloatTensor [n_labeled]
+    - X_unlabeled: torch.FloatTensor [n_unlabeled, 2*data_dim] as [values | null_mask]
+    - data_dim: int number of clinical features (without mask)
+    - binary_cols: int number of binary features at the end of the data slice
+    """
+    dataset_known, dataset_unknown = load_known_unknown(years=years)
+    y = dataset_known.iloc[:, -1].to_numpy()
+    X_known_df = dataset_known.iloc[:, :-1]
+    X_unknown_df = dataset_unknown
+
+    binary_cols = infer_binary_feature_count(X_known_df)
+    values_kn, mask_kn = _build_values_and_mask(X_known_df)
+    values_unk, mask_unk = _build_values_and_mask(X_unknown_df)
+
+    X_labeled = np.concatenate((values_kn, mask_kn), axis=1).astype(np.float32)
+    X_unlabeled = np.concatenate((values_unk, mask_unk), axis=1).astype(np.float32)
+
+    return {
+        "X_labeled": torch.from_numpy(X_labeled),
+        "y_labeled": torch.from_numpy(y).float(),
+        "X_unlabeled": torch.from_numpy(X_unlabeled),
+        "data_dim": X_known_df.shape[1],
+        "binary_cols": binary_cols,
+    }
+
+
 def preprocess_known_unknown_split(
     dataset_known: pd.DataFrame,
     dataset_unknown: pd.DataFrame,

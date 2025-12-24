@@ -7,14 +7,14 @@ import numpy as np
 import torch
 from joblib import Memory
 from sklearn.metrics import classification_report
-from sklearn.model_selection import GridSearchCV, PredefinedSplit, train_test_split
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from skorch import NeuralNetClassifier
 from skorch.callbacks import EarlyStopping
 
 from classifier import ClassifierBinary
 from modelEncoderDecoderAndvancedV3VAE import MIEOVAE
-from utilsData import load_known_unknown, preprocess_known_unknown_split, set_cpu
+from utilsData import load_dataset, set_cpu
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -70,76 +70,37 @@ def build_param_grid(latent_dims: List[int], baseline_input_dim: int) -> List[di
     )
     return grid_list
 
-
-def _pos_weight_from_train_labels(y_train: torch.Tensor) -> float:
-    pos = float(y_train.sum().item())
-    neg = float(y_train.shape[0] - pos)
-    return neg / max(pos, 1.0)
-
-
 def run():
     device = set_cpu()
     torch.manual_seed(42)
 
     # ----------------------------------------------------------------------
-    # Load raw labeled/unlabeled data, then define the split strategy here.
+    # Load full labeled/unlabeled tensors.
     #
-    # Keeping the split logic in main makes it easy to switch to StratifiedKFold in the future:
-    # - first create a hold-out test split on labeled data
-    # - then run StratifiedKFold on the remaining labeled dev set
-    # - call preprocess_known_unknown_split per fold (or move preprocessing into a Pipeline step)
+    # The split/CV strategy is defined here (not in the loader) so you can easily switch between:
+    # - holdout validation (PredefinedSplit)
+    # - StratifiedKFold / RepeatedStratifiedKFold
+    # - nested CV, etc.
     # ----------------------------------------------------------------------
-    years = 8
-    dataset_known, dataset_unknown = load_known_unknown(years=years)
-    y_all = dataset_known.iloc[:, -1].to_numpy()
-    all_idx = np.arange(len(y_all))
-    dev_idx, test_idx = train_test_split(
-        all_idx, test_size=0.2, random_state=42, stratify=y_all
-    )
-    train_idx, val_idx = train_test_split(
-        dev_idx, test_size=0.2, random_state=42, stratify=y_all[dev_idx]
-    )
-    data_dict = preprocess_known_unknown_split(
-        dataset_known=dataset_known,
-        dataset_unknown=dataset_unknown,
-        train_idx=train_idx,
-        val_idx=val_idx,
-        test_idx=test_idx,
-    )
-    tr_data = data_dict["tr_data"]
-    tr_out = data_dict["tr_out"]
-    val_data = data_dict["val_data"]
-    val_out = data_dict["val_out"]
-    test_data = data_dict["test_data"]
-    test_out = data_dict["test_out"]
-    X_unlabeled = data_dict.get("tr_unlabled")
-    binary_cols = data_dict["bin_col"]
+    data = load_dataset(years=8, test_size=0.2, random_state=42,unlabeled=True)
+ 
+    X_dev = data["X_dev"]
+    y_dev = data["y_dev"]
+    X_test = data["X_test"]
+    y_test = data["y_test"]
+    X_unlabeled = data["X_unlabeled"]
+    binary_cols = data["binary_cols"]
 
-    input_dim = tr_data.shape[1]
-    data_dim = input_dim // 2  # because preprocessing appends a same-size mask
-
-    # Build dev set (train + val) with a predefined split for CV
-    X_dev = torch.cat((tr_data, val_data), dim=0).cpu().numpy()
-    y_dev = torch.cat((tr_out, val_out), dim=0).cpu().numpy()
-    test_fold = np.concatenate(
-        (
-            np.full(tr_data.shape[0], -1, dtype=int),  # train indices
-            np.zeros(val_data.shape[0], dtype=int),  # validation fold = 0
-        )
-    )
-    cv_split = PredefinedSplit(test_fold=test_fold)
-
-    X_test = test_data.cpu().numpy()
-    y_test = test_out.cpu().numpy()
-    X_unlabeled_np = None if X_unlabeled is None else X_unlabeled.cpu().numpy()
-
-    pos_weight = _pos_weight_from_train_labels(tr_out)
+    cv_split = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    pos = float(y_dev.sum())
+    neg = float(len(y_dev) - pos)
+    pos_weight = neg / max(pos, 1.0)
 
     memory = Memory(location="_pipe_cache_", verbose=0)
 
     vae_estimator = MIEOVAE(
-        module__data_dim=data_dim,
-        module__mask_dim=data_dim,
+        module__data_dim=X_dev.shape[1],
+        module__mask_dim=X_dev.shape[1],
         module__binary=binary_cols,
         module__hidden_dims=[256, 128, 64],
         optimizer=torch.optim.Adam,
@@ -152,7 +113,7 @@ def run():
 
     clf_estimator = NeuralNetClassifier(
         module=ClassifierBinary,
-        module__inputSize=data_dim,  # overridden by grid
+        module__inputSize=X_dev.shape[1],  # overridden by grid
         optimizer=torch.optim.Adam,
         lr=1e-3,
         batch_size=128,
@@ -166,7 +127,7 @@ def run():
     )
 
     latent_dims = [8, 16, 32]
-    param_grid = build_param_grid(latent_dims, baseline_input_dim=input_dim)
+    param_grid = build_param_grid(latent_dims, baseline_input_dim=X_dev.shape[1])
 
     pipe = Pipeline(steps=[("vae", vae_estimator), ("clf", clf_estimator)], memory=memory)
 
@@ -181,7 +142,7 @@ def run():
     )
 
     begin = time()
-    grid.fit(X_dev, y_dev, vae__X_unlabeled=X_unlabeled_np)
+    grid.fit(X_dev, y_dev, vae__X_unlabeled=X_unlabeled)
     fit_time = time() - begin
 
     best_model = grid.best_estimator_
