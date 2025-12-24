@@ -106,9 +106,6 @@ def run():
         module__binary=binary_cols,
         module__hidden_dims=[256, 128, 64],
         optimizer=torch.optim.Adam,
-        lr=1e-3,
-        batch_size=256,
-        max_epochs=50,
         device=device,
         verbose=0,
     )
@@ -117,9 +114,6 @@ def run():
         module=ClassifierBinary,
         module__inputSize=data_dim,  # overridden by grid
         optimizer=torch.optim.Adam,
-        lr=1e-3,
-        batch_size=128,
-        max_epochs=50,
         device=device,
         criterion=torch.nn.BCEWithLogitsLoss,
         criterion__pos_weight=torch.tensor([pos_weight], device=device),
