@@ -183,6 +183,57 @@ def dataset_loader_full(years:int) -> 'dict[str,torch.Tensor]':
 
     return dataset_loader(dataset, 0.2, 0.2, 42, oversampling=False, unlabledDataset=dataset_unk)
 
+def load_dataset(
+    years: int,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    unlabeled: bool = True,
+) -> dict:
+    """
+    Dataset hook used by `Encoder_classifier/main.py`.
+
+    Another person can replace/extend this as needed (e.g., different preprocessing,
+    different missingness handling, different splits).
+
+    Expected return keys:
+    - X_dev: numpy array, labeled development set features, shape [n_dev, 2*data_dim] as [values | null_mask]
+    - y_dev: numpy array, labels for dev set, shape [n_dev]
+    - X_test: numpy array, labeled test set features, shape [n_test, 2*data_dim]
+    - y_test: numpy array, labels for test set, shape [n_test]
+    - X_unlabeled: numpy array, unlabeled features, shape [n_unlabeled, 2*data_dim] (or None if unlabeled=False)
+    - binary_cols: int, number of binary features at the end of the values slice
+    """
+    folderName = f'./Datasets/Cleaned_Dataset_{years}Y/'
+    fileName_kn = 'chl_dataset_known.csv'
+    fileName_unk = 'chl_dataset_unknown.csv'
+    dataset = load_data(folderName + fileName_kn)
+    dataset_unk = load_data(folderName + fileName_unk) if unlabeled else None
+
+    data = dataset_loader(
+        dataset,
+        val_size=0.2,
+        test_size=test_size,
+        random_state=random_state,
+        oversampling=False,
+        unlabledDataset=dataset_unk,
+    )
+    X_dev = torch.cat((data["tr_data"], data["val_data"]), dim=0).cpu().numpy()
+    y_dev = torch.cat((data["tr_out"], data["val_out"]), dim=0).cpu().numpy()
+    X_test = data["test_data"].cpu().numpy()
+    y_test = data["test_out"].cpu().numpy()
+    X_unlabeled = None
+    if unlabeled:
+        X_unlabeled = None if data["tr_unlabled"] is None else data["tr_unlabled"].cpu().numpy()
+
+    return {
+        "X_dev": X_dev,
+        "y_dev": y_dev,
+        "X_test": X_test,
+        "y_test": y_test,
+        "X_unlabeled": X_unlabeled,
+        "binary_cols": data["bin_col"],
+    }
+
 def load_past_results_and_models(old_results:bool=False)->Tuple[list,list,set]:
     '''
     function to load the past results and models
