@@ -183,155 +183,55 @@ def dataset_loader_full(years:int) -> 'dict[str,torch.Tensor]':
 
     return dataset_loader(dataset, 0.2, 0.2, 42, oversampling=False, unlabledDataset=dataset_unk)
 
-
-def load_known_unknown(years: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def load_dataset(
+    years: int,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    unlabeled: bool = True,
+) -> dict:
     """
-    Load the labeled ("known") and unlabeled ("unknown") datasets for a given horizon.
+    Dataset hook used by `Encoder_classifier/main.py`.
 
-    Returns the raw pandas DataFrames (no split / no preprocessing), so callers can
-    implement custom split strategies (e.g., StratifiedKFold) without changing IO.
+    Another person can replace/extend this as needed (e.g., different preprocessing,
+    different missingness handling, different splits).
+
+    Expected return keys:
+    - X_dev: numpy array, labeled development set features, shape [n_dev, 2*data_dim] as [values | null_mask]
+    - y_dev: numpy array, labels for dev set, shape [n_dev]
+    - X_test: numpy array, labeled test set features, shape [n_test, 2*data_dim]
+    - y_test: numpy array, labels for test set, shape [n_test]
+    - X_unlabeled: numpy array, unlabeled features, shape [n_unlabeled, 2*data_dim] (or None if unlabeled=False)
+    - binary_cols: int, number of binary features at the end of the values slice
     """
     folderName = f'./Datasets/Cleaned_Dataset_{years}Y/'
     fileName_kn = 'chl_dataset_known.csv'
     fileName_unk = 'chl_dataset_unknown.csv'
     dataset = load_data(folderName + fileName_kn)
-    dataset_unk = load_data(folderName + fileName_unk)
-    return dataset, dataset_unk
+    dataset_unk = load_data(folderName + fileName_unk) if unlabeled else None
 
-
-def _build_values_and_mask(df_features: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Return (values_filled, null_mask) where:
-    - values_filled: NaNs replaced with 0.0
-    - null_mask: 1 for observed entries, 0 for missing
-    """
-    null_mask = (1 - df_features.isnull().astype(int)).to_numpy()
-    values_filled = df_features.fillna(0.0).to_numpy()
-    return values_filled, null_mask
-
-
-def infer_binary_feature_count(df_features: pd.DataFrame) -> int:
-    """
-    Infer how many binary features are present at the end of the feature vector.
-
-    This assumes the column order is:
-        [continuous..., binary...]
-    which is required by the current MIEO decoder/loss implementation.
-    """
-    is_binary = []
-    for col in df_features.columns:
-        observed = df_features[col].dropna()
-        if observed.empty:
-            is_binary.append(False)
-            continue
-        unique = set(observed.unique())
-        is_binary.append(unique.issubset({0, 1}))
-
-    if not any(is_binary):
-        return 0
-
-    first_binary = next((i for i, b in enumerate(is_binary) if b), None)
-    assert first_binary is not None
-    if any(not b for b in is_binary[first_binary:]):
-        raise ValueError(
-            "Binary features must be contiguous at the end of the feature vector "
-            "(expected [continuous..., binary...]). Reorder columns or provide a fixed "
-            "binary feature count from preprocessing."
-        )
-    return len(is_binary) - first_binary
-
-
-def load_mieo_tensors(years: int) -> 'dict[str,torch.Tensor | int]':
-    """
-    Minimal IO + mask construction for flexible CV strategies.
-
-    Returns:
-    - X_labeled: torch.FloatTensor [n_labeled, 2*data_dim] as [values | null_mask]
-    - y_labeled: torch.FloatTensor [n_labeled]
-    - X_unlabeled: torch.FloatTensor [n_unlabeled, 2*data_dim] as [values | null_mask]
-    - data_dim: int number of clinical features (without mask)
-    - binary_cols: int number of binary features at the end of the data slice
-    """
-    dataset_known, dataset_unknown = load_known_unknown(years=years)
-    y = dataset_known.iloc[:, -1].to_numpy()
-    X_known_df = dataset_known.iloc[:, :-1]
-    X_unknown_df = dataset_unknown
-
-    binary_cols = infer_binary_feature_count(X_known_df)
-    values_kn, mask_kn = _build_values_and_mask(X_known_df)
-    values_unk, mask_unk = _build_values_and_mask(X_unknown_df)
-
-    X_labeled = np.concatenate((values_kn, mask_kn), axis=1).astype(np.float32)
-    X_unlabeled = np.concatenate((values_unk, mask_unk), axis=1).astype(np.float32)
-
-    return {
-        "X_labeled": torch.from_numpy(X_labeled),
-        "y_labeled": torch.from_numpy(y).float(),
-        "X_unlabeled": torch.from_numpy(X_unlabeled),
-        "data_dim": X_known_df.shape[1],
-        "binary_cols": binary_cols,
-    }
-
-
-def preprocess_known_unknown_split(
-    dataset_known: pd.DataFrame,
-    dataset_unknown: pd.DataFrame,
-    train_idx: np.ndarray,
-    val_idx: np.ndarray,
-    test_idx: np.ndarray,
-) -> 'dict[str,torch.Tensor]':
-    """
-    Preprocess known/unknown datasets given explicit split indices.
-
-    Expected layout:
-    - dataset_known: features + label in the last column
-    - dataset_unknown: features only (no label)
-
-    Output tensors follow the project convention:
-    - missing values are set to 0 in the values slice
-    - null mask is concatenated as additional features: X = [values | mask]
-    """
-    y_all = dataset_known.iloc[:, -1]
-    X_all = dataset_known.iloc[:, :-1]
-
-    train_out = y_all.iloc[train_idx]
-    val_out = y_all.iloc[val_idx]
-    test_out = y_all.iloc[test_idx]
-
-    train_data = X_all.iloc[train_idx].copy()
-    val_data = X_all.iloc[val_idx].copy()
-    test_data = X_all.iloc[test_idx].copy()
-
-    train_mask = (1 - train_data.isnull().astype(int)).to_numpy()
-    val_mask = (1 - val_data.isnull().astype(int)).to_numpy()
-    test_mask = (1 - test_data.isnull().astype(int)).to_numpy()
-
-    unknown_data = dataset_unknown.copy()
-    unknown_mask = (1 - unknown_data.isnull().astype(int)).to_numpy()
-
-    train_data, val_data, test_data, unknown_data, binary_clumns = normalize_data(
-        train_data, val_data, test_data, train_mask, unknown_data
+    data = dataset_loader(
+        dataset,
+        val_size=0.2,
+        test_size=test_size,
+        random_state=random_state,
+        oversampling=False,
+        unlabledDataset=dataset_unk,
     )
-
-    train_data[train_mask == 0] = 0
-    val_data[val_mask == 0] = 0
-    test_data[test_mask == 0] = 0
-    unknown_data[unknown_mask == 0] = 0
-
-    train_arr = np.concatenate((train_data, train_mask), axis=1).astype(np.float32)
-    val_arr = np.concatenate((val_data, val_mask), axis=1).astype(np.float32)
-    test_arr = np.concatenate((test_data, test_mask), axis=1).astype(np.float32)
-    unknown_arr = np.concatenate((unknown_data, unknown_mask), axis=1).astype(np.float32)
+    X_dev = torch.cat((data["tr_data"], data["val_data"]), dim=0).cpu().numpy()
+    y_dev = torch.cat((data["tr_out"], data["val_out"]), dim=0).cpu().numpy()
+    X_test = data["test_data"].cpu().numpy()
+    y_test = data["test_out"].cpu().numpy()
+    X_unlabeled = None
+    if unlabeled:
+        X_unlabeled = None if data["tr_unlabled"] is None else data["tr_unlabled"].cpu().numpy()
 
     return {
-        'tr_data': torch.from_numpy(train_arr),
-        'tr_out': torch.from_numpy(train_out.to_numpy()).float(),
-        'val_data': torch.from_numpy(val_arr),
-        'val_out': torch.from_numpy(val_out.to_numpy()).float(),
-        'test_data': torch.from_numpy(test_arr),
-        'test_out': torch.from_numpy(test_out.to_numpy()).float(),
-        'bin_col': binary_clumns,
-        'tr_unlabled': torch.from_numpy(unknown_arr),
+        "X_dev": X_dev,
+        "y_dev": y_dev,
+        "X_test": X_test,
+        "y_test": y_test,
+        "X_unlabeled": X_unlabeled,
+        "binary_cols": data["bin_col"],
     }
 
 def load_past_results_and_models(old_results:bool=False)->Tuple[list,list,set]:

@@ -92,15 +92,17 @@ def run():
     binary_cols = data["binary_cols"]
 
     cv_split = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    
     pos = float(y_dev.sum())
     neg = float(len(y_dev) - pos)
     pos_weight = neg / max(pos, 1.0)
+    data_dim = X_dev.shape[1] // 2 
 
     memory = Memory(location="_pipe_cache_", verbose=0)
 
     vae_estimator = MIEOVAE(
-        module__data_dim=X_dev.shape[1],
-        module__mask_dim=X_dev.shape[1],
+        module__data_dim=data_dim,
+        module__mask_dim=data_dim,
         module__binary=binary_cols,
         module__hidden_dims=[256, 128, 64],
         optimizer=torch.optim.Adam,
@@ -113,7 +115,7 @@ def run():
 
     clf_estimator = NeuralNetClassifier(
         module=ClassifierBinary,
-        module__inputSize=X_dev.shape[1],  # overridden by grid
+        module__inputSize=data_dim,  # overridden by grid
         optimizer=torch.optim.Adam,
         lr=1e-3,
         batch_size=128,
